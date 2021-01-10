@@ -22,7 +22,8 @@ from transformers import (
     ElectraForPreTraining,
     ElectraForMaskedLM,
     ElectraForMultipleChoice,
-    ElectraForSequenceClassification
+    ElectraForSequenceClassification,
+    PretrainedConfig
 )
 
 from QDElectra_model import (
@@ -266,23 +267,23 @@ class TokenIndexing(Pipeline):
         return input_ids, attention_mask, token_type_ids, label_id
 
 
-class QuantizedDistillElectraTrainConfig(NamedTuple):
-    """ Hyperparameters for training """
-    seed: int = 3431 # random seed
-    batch_size: int = 32
-    lr: int = 5e-5 # learning rate
-    n_epochs: int = 10 # the number of epoch
-    # `warm up` period = warmup(0.1)*total_steps
-    # linearly increasing learning rate from zero to the specified value(5e-5)
-    warmup: float = 0.1
-    save_steps: int = 100 # interval for saving model
-    total_steps: int = 100000 # total number of steps to train
-    temperature: int = 1 # temperature for QD-electra logit loss
-    lambda_: int = 50 # lambda for QD-electra discriminator loss
-
-    @classmethod
-    def from_json(cls, file): # load config from json file
-        return cls(**json.load(open(file, "r")))
+# class QuantizedDistillElectraTrainConfig(NamedTuple):
+#     """ Hyperparameters for training """
+#     seed: int = 3431 # random seed
+#     batch_size: int = 32
+#     lr: int = 5e-5 # learning rate
+#     n_epochs: int = 10 # the number of epoch
+#     # `warm up` period = warmup(0.1)*total_steps
+#     # linearly increasing learning rate from zero to the specified value(5e-5)
+#     warmup: float = 0.1
+#     save_steps: int = 100 # interval for saving model
+#     total_steps: int = 100000 # total number of steps to train
+#     temperature: int = 1 # temperature for QD-electra logit loss
+#     lambda_: int = 50 # lambda for QD-electra discriminator loss
+#
+#     @classmethod
+#     def from_json(cls, file): # load config from json file
+#         return cls(**json.load(open(file, "r")))
 
 
 def simple_accuracy(preds, labels):
@@ -349,6 +350,45 @@ def get_tensor_data(output_mode, input_ids, attention_mask, token_type_ids, labe
     tensor_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_seq_lengths)
 
     return tensor_data, all_label_ids
+
+
+def get_task_params(task):
+    processors = {
+        "cola":    COLA,
+        "mnli":    MNLI,
+        "mrpc":    MRPC,
+        "sst-2":   SST2,
+        "sts-b":   STSB,
+        "qqp":     QQP,
+        "qnli":    QNLI,
+        "rte":     RTE,
+        "wnli":    WNLI
+    }
+
+    output_modes = {
+        "cola":  "classification",
+        "mnli":  "classification",
+        "mrpc":  "classification",
+        "sst-2": "classification",
+        "sts-b": "regression",
+        "qqp":   "classification",
+        "qnli":  "classification",
+        "rte":   "classification",
+        "wnli":  "classification"
+    }
+
+    # intermediate distillation default parameters
+    default_params = {
+        "cola":  {"n_epochs": 50, "max_len": 64},
+        "mnli":  {"n_epochs": 5,  "max_len": 128},
+        "mrpc":  {"n_epochs": 20, "max_len": 128},
+        "sst-2": {"n_epochs": 10, "max_len": 64},
+        "sts-b": {"n_epochs": 20, "max_len": 128},
+        "qqp":   {"n_epochs": 5,  "max_len": 128},
+        "qnli":  {"n_epochs": 10, "max_len": 128},
+        "rte":   {"n_epochs": 20, "max_len": 128}
+    }
+    return output_modes[task], default_params[task]["n_epochs"], default_params[task]["max_len"]
 
 
 class QuantizedDistillElectraTrainer(train.Trainer):
@@ -423,16 +463,16 @@ class QuantizedDistillElectraTrainer(train.Trainer):
         eval_loss = 0
         eval_steps = 0
         preds = []
-        input_ids, attention_mask, token_type_ids, label_id = batch
+        input_ids, attention_mask, token_type_ids, label_ids = batch
 
-        _, s_outputs, _ = model(input_ids, attention_mask, token_type_ids, label_id )
+        _, s_outputs, _ = model(input_ids, attention_mask, token_type_ids, label_ids )
 
         if output_mode == "classifcation":
             logits_loss = self.ceLoss()
-            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1, num_labels), label_id)
+            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1, num_labels), label_ids)
         elif output_mode == "regression":
             logits_loss = self.mseLoss()
-            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1), label_id)
+            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1), label_ids)
 
         eval_loss += tmp_eval_loss.mean().item()
         eval_steps += 1
@@ -457,70 +497,23 @@ class QuantizedDistillElectraTrainer(train.Trainer):
 
 
 def main(task='mrpc',
+         base_train_cfg='config/QDElectra_pretrain.json',
          train_cfg='config/train_mrpc.json',
-         model_cfg='config/QDElectra_pretrain.json',
+         model_cfg='config/QDElectra_base.json',
          data_file='../glue/MRPC/train.tsv',
          model_file=None,
          data_parallel=True,
          vocab='../uncased_L-12_H-768_A-12/vocab.txt',
          log_dir='../exp/electra/pretrain/runs',
          save_dir='../exp/bert/mrpc',
-         max_len=128,
          mode='train',
          pred_distill=True):
-
-    processors = {
-        "cola":    COLA,
-        "mnli":    MNLI,
-        "mrpc":    MRPC,
-        "sst-2":   SST2,
-        "sts-b":   STSB,
-        "qqp":     QQP,
-        "qnli":    QNLI,
-        "rte":     RTE,
-        "wnli":    WNLI
-    }
-
-    output_modes = {
-        "cola":  "classification",
-        "mnli":  "classification",
-        "mrpc":  "classification",
-        "sst-2": "classification",
-        "sts-b": "regression",
-        "qqp":   "classification",
-        "qnli":  "classification",
-        "rte":   "classification",
-        "wnli":  "classification"
-    }
-
-    # intermediate distillation default parameters
-    default_params = {
-        "cola":  {"n_epochs": 50, "max_len": 64},
-        "mnli":  {"n_epochs": 5,  "max_len": 128},
-        "mrpc":  {"n_epochs": 20, "max_len": 128},
-        "sst-2": {"n_epochs": 10, "max_len": 64},
-        "sts-b": {"n_epochs": 20, "max_len": 128},
-        "qqp":   {"n_epochs": 5,  "max_len": 128},
-        "qnli":  {"n_epochs": 10, "max_len": 128},
-        "rte":   {"n_epochs": 20, "max_len": 128}
-    }
-
-    # acc_tasks = ["mnli", "mrpc", "sst-2", "qqp", "qnli", "rte"]
-    # corr_tasks = ["sts-b"]
-    # mcc_tasks = ["cola"]
-
-    if task in default_params:
-        max_len = default_params [task]["max_len"]
-
-    if task not in processors:
-        raise ValueError("Task not found: %s" % task)
-
-    output_mode = output_modes[task] # classofication or regression task
-
-    train_cfg = QuantizedDistillElectraTrainConfig.from_json(train_cfg)
-    train_cfg.n_epochs = default_params [task]['n_epochs']
-
+    train_cfg_dict = json.load(open(base_train_cfg, "r"))
+    train_cfg_dict.update(json.load(open(train_cfg, "r")))
+    train_cfg = ElectraConfig().from_dict(train_cfg_dict)
+    # train_cfg = ElectraConfig().from_json_file(train_cfg)
     model_cfg = ElectraConfig().from_json_file(model_cfg)
+    output_mode, train_cfg.n_epochs, max_len = get_task_params(task)
     set_seeds(train_cfg.seed)
 
     tokenizer = tokenization.FullTokenizer(vocab_file=vocab, do_lower_case=True)
@@ -551,11 +544,11 @@ def main(task='mrpc',
     if mode == 'train':
         trainer.train(model_file, None, data_parallel)
     elif mode == 'eval':
-        input_ids, attention_mask, token_type_ids, label_id = TokenIndexing(tokenizer.convert_tokens_to_ids,
+        input_ids, attention_mask, token_type_ids, label_ids = TokenIndexing(tokenizer.convert_tokens_to_ids,
                                                                             TaskDataset.labels,
                                                                             output_mode,
                                                                             max_len)
-        _, eval_labels = get_tensor_data(output_mode, input_ids, attention_mask, token_type_ids, label_id)
+        _, eval_labels = get_tensor_data(output_mode, input_ids, attention_mask, token_type_ids, label_ids)
         results = trainer.eval(model_file, output_mode, eval_labels, num_labels, data_parallel)
         total_accuracy = torch.cat(results).mean().item()
         print('Accuracy:', total_accuracy)
