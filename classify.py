@@ -7,11 +7,14 @@ import itertools
 import csv
 import fire
 import json
+import numpy as np
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import matthews_corrcoef, f1_score
 
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from tensorboardX import SummaryWriter
 from transformers import (
     ElectraConfig,
@@ -236,11 +239,12 @@ class AddSpecialTokensWithTruncation(Pipeline):
 
 class TokenIndexing(Pipeline):
     """ Convert tokens into token indexes and do zero-padding """
-    def __init__(self, indexer, labels, max_len=512):
+    def __init__(self, indexer, labels, output_mode ,max_len=512):
         super().__init__()
         self.indexer = indexer # function : tokens to indexes
         # map from a label name to a label index
         self.label_map = {name: i for i, name in enumerate(labels)}
+        self.output_mode = output_mode
         self.max_len = max_len
 
     def __call__(self, instance):
@@ -249,9 +253,10 @@ class TokenIndexing(Pipeline):
         input_ids = self.indexer(tokens_a + tokens_b)
         token_type_ids = [0]*len(tokens_a) + [1]*len(tokens_b) # token type ids
         attention_mask = [1]*(len(tokens_a) + len(tokens_b))
-
-        label_id = self.label_map[label]
-
+        if self.output_mode == "classifcation":
+            label_id = self.label_map[label]
+        else:
+            label_id = float(label)
         # zero padding
         n_pad = self.max_len - len(input_ids)
         input_ids.extend([0]*n_pad)
@@ -280,12 +285,79 @@ class QuantizedDistillElectraTrainConfig(NamedTuple):
         return cls(**json.load(open(file, "r")))
 
 
+def simple_accuracy(preds, labels):
+    return (preds == labels).mean()
+
+
+def acc_and_f1(preds, labels):
+    acc = simple_accuracy(preds, labels)
+    f1 = f1_score(y_true=labels, y_pred=preds)
+    return {
+        "acc": acc,
+        "f1": f1,
+        "acc_and_f1": (acc + f1) / 2,
+    }
+
+
+def pearson_and_spearman(preds, labels):
+    pearson_corr = pearsonr(preds, labels)[0]
+    spearman_corr = spearmanr(preds, labels)[0]
+    return {
+        "pearson": pearson_corr,
+        "spearmanr": spearman_corr,
+        "corr": (pearson_corr + spearman_corr) / 2,
+    }
+
+
+def compute_metrics(task_name, preds, labels):
+    assert len(preds) == len(labels)
+    if task_name == "cola":
+        return {"mcc": matthews_corrcoef(labels, preds)}
+    elif task_name == "sst-2":
+        return {"acc": simple_accuracy(preds, labels)}
+    elif task_name == "mrpc":
+        return acc_and_f1(preds, labels)
+    elif task_name == "sts-b":
+        return pearson_and_spearman(preds, labels)
+    elif task_name == "qqp":
+        return acc_and_f1(preds, labels)
+    elif task_name == "mnli":
+        return {"acc": simple_accuracy(preds, labels)}
+    elif task_name == "mnli-mm":
+        return {"acc": simple_accuracy(preds, labels)}
+    elif task_name == "qnli":
+        return {"acc": simple_accuracy(preds, labels)}
+    elif task_name == "rte":
+        return {"acc": simple_accuracy(preds, labels)}
+    elif task_name == "wnli":
+        return {"acc": simple_accuracy(preds, labels)}
+    else:
+        raise KeyError(task_name)
+
+
+def get_tensor_data(output_mode, input_ids, attention_mask, token_type_ids, label_id):
+    features = [input_ids, attention_mask, token_type_ids, label_id]
+    if output_mode == "classification":
+        all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+    elif output_mode == "regression":
+        all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
+
+    all_seq_lengths = torch.tensor([f.seq_length for f in features], dtype=torch.long)
+    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+    tensor_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_seq_lengths)
+
+    return tensor_data, all_label_ids
+
+
 class QuantizedDistillElectraTrainer(train.Trainer):
     def __init__(self, writer, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.writer = writer
         self.bceLoss = nn.BCELoss()
         self.mseLoss = nn.MSELoss()
+        self.ceLoss = nn.CrossEntropyLoss()
 
     def get_loss(self, model, batch, global_step, train_cfg, model_cfg): # make sure loss is tensor
         t_outputs, s_outputs, s2t_hidden_states = model(*batch)
@@ -345,13 +417,43 @@ class QuantizedDistillElectraTrainer(train.Trainer):
 
         return total_loss
 
-    def evaluate(self, model, batch):
+
+    def evaluate(self, model, task_name, output_mode, eval_labels, num_labels, batch):
+
+        eval_loss = 0
+        eval_steps = 0
+        preds = []
         input_ids, attention_mask, token_type_ids, label_id = batch
-        logits = model(input_ids, token_type_ids, attention_mask)
-        _, label_pred = logits.max(1)
-        result = (label_pred == label_id).float()  # .cpu().numpy()
-        accuracy = result.mean()
-        return accuracy, result
+
+        _, s_outputs, _ = model(input_ids, attention_mask, token_type_ids, label_id )
+
+        if output_mode == "classifcation":
+            logits_loss = self.ceLoss()
+            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1, num_labels), label_id)
+        elif output_mode == "regression":
+            logits_loss = self.mseLoss()
+            tmp_eval_loss = logits_loss (s_outputs.logits.view(-1), label_id)
+
+        eval_loss += tmp_eval_loss.mean().item()
+        eval_steps += 1
+
+        if len(preds) == 0:
+            preds.append(s_outputs.logits.detach().cpu().numpy())
+        else:
+            preds[0] = np.append(
+                preds[0], s_outputs.logits.detach().cpu().numpy(), axis=0)
+
+        eval_loss = eval_loss / eval_steps
+
+        preds = preds[0]
+        if output_mode == "classification":
+            preds = np.argmax(preds, axis=1)
+        elif output_mode == "regression":
+            preds = np.squeeze(preds)
+        result = compute_metrics(task_name, preds, eval_labels.numpy())
+        result['eval_loss'] = eval_loss
+
+        return result
 
 
 def main(task='mrpc',
@@ -393,14 +495,14 @@ def main(task='mrpc',
 
     # intermediate distillation default parameters
     default_params = {
-        "cola":  {"num_train_epochs": 50, "max_len": 64},
-        "mnli":  {"num_train_epochs": 5,  "max_len": 128},
-        "mrpc":  {"num_train_epochs": 20, "max_len": 128},
-        "sst-2": {"num_train_epochs": 10, "max_len": 64},
-        "sts-b": {"num_train_epochs": 20, "max_len": 128},
-        "qqp":   {"num_train_epochs": 5,  "max_len": 128},
-        "qnli":  {"num_train_epochs": 10, "max_len": 128},
-        "rte":   {"num_train_epochs": 20, "max_len": 128}
+        "cola":  {"n_epochs": 50, "max_len": 64},
+        "mnli":  {"n_epochs": 5,  "max_len": 128},
+        "mrpc":  {"n_epochs": 20, "max_len": 128},
+        "sst-2": {"n_epochs": 10, "max_len": 64},
+        "sts-b": {"n_epochs": 20, "max_len": 128},
+        "qqp":   {"n_epochs": 5,  "max_len": 128},
+        "qnli":  {"n_epochs": 10, "max_len": 128},
+        "rte":   {"n_epochs": 20, "max_len": 128}
     }
 
     # acc_tasks = ["mnli", "mrpc", "sst-2", "qqp", "qnli", "rte"]
@@ -413,19 +515,21 @@ def main(task='mrpc',
     if task not in processors:
         raise ValueError("Task not found: %s" % task)
 
-    processor = processors[task]
-    output_mode = output_modes[task]
+    output_mode = output_modes[task] # classofication or regression task
 
     train_cfg = QuantizedDistillElectraTrainConfig.from_json(train_cfg)
+    train_cfg.n_epochs = default_params [task]['n_epochs']
+
     model_cfg = ElectraConfig().from_json_file(model_cfg)
     set_seeds(train_cfg.seed)
 
     tokenizer = tokenization.FullTokenizer(vocab_file=vocab, do_lower_case=True)
     TaskDataset = dataset_class(task) # task dataset class according to the task
+    num_labels = len(TaskDataset.labels)
     pipeline = [
         Tokenizing(tokenizer.convert_to_unicode, tokenizer.tokenize),
         AddSpecialTokensWithTruncation(max_len),
-        TokenIndexing(tokenizer.convert_tokens_to_ids, TaskDataset.labels, max_len)
+        TokenIndexing(tokenizer.convert_tokens_to_ids, TaskDataset.labels, output_mode, max_len)
     ]
     data_set = TaskDataset(data_file, pipeline)
     data_iter = DataLoader(data_set, batch_size=train_cfg.batch_size, shuffle=True)
@@ -447,7 +551,12 @@ def main(task='mrpc',
     if mode == 'train':
         trainer.train(model_file, None, data_parallel)
     elif mode == 'eval':
-        results = trainer.eval(model_file, data_parallel)
+        input_ids, attention_mask, token_type_ids, label_id = TokenIndexing(tokenizer.convert_tokens_to_ids,
+                                                                            TaskDataset.labels,
+                                                                            output_mode,
+                                                                            max_len)
+        _, eval_labels = get_tensor_data(output_mode, input_ids, attention_mask, token_type_ids, label_id)
+        results = trainer.eval(model_file, output_mode, eval_labels, num_labels, data_parallel)
         total_accuracy = torch.cat(results).mean().item()
         print('Accuracy:', total_accuracy)
 

@@ -62,7 +62,7 @@ class Trainer(object):
             print('Epoch %d/%d : Average Loss %5.3f' % (e+1, self.train_cfg.n_epochs, loss_sum / (i+1)))
         self.save(global_step)
 
-    def eval(self, model_file, data_parallel=True):
+    def eval(self, model_file, output_mode, eval_labels, num_labels, data_parallel=True):
         """ Evaluation Loop """
         self.model.eval() # evaluation mode
         self.load(model_file, None)
@@ -75,7 +75,7 @@ class Trainer(object):
         for batch in iter_bar:
             batch = [t.to(self.device) for t in batch]
             with torch.no_grad(): # evaluation without gradient calculation
-                accuracy, result = self.evaluate(model, batch) # accuracy to print
+                accuracy, result = self.evaluate(model, output_mode, eval_labels, num_labels, batch) # accuracy to print
             results.append(result)
 
             iter_bar.set_description('Iter(acc=%5.3f)' % accuracy)
@@ -109,7 +109,7 @@ class Trainer(object):
         return NotImplementedError
 
     @abstractmethod
-    def evaluate(self, model, batch):
+    def evaluate(self, model, task_name, output_mode, eval_labels, num_labels, batch):
         return NotImplementedError
 
 
